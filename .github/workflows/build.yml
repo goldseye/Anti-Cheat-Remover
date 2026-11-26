@@ -1,1 +1,1021 @@
+name: release-apk
+on:
+  workflow_dispatch:
+  push:
+    paths-ignore:
+      - '.github/**'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+      - name: Generate project
+        run: |
+          mkdir -p project
+          cd project
+          mkdir -p gradle/wrapper app/src/main/java/ai/venice/questackill app/src/main/res/values
+
+          cat > settings.gradle.kts <<'EOF_A'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "QuestACKill"
+          include(":app")
+          EOF_A
+
+          cat > build.gradle.kts <<'EOF_B'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          EOF_B
+
+          cat > gradle.properties <<'EOF_C'
+          org.gradle.jvmargs=-Xmx4096m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF_C
+
+          cat > app/build.gradle.kts <<'EOF_D'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "ai.venice.questackill"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "ai.venice.questackill"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildFeatures { compose = true }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+                  isCoreLibraryDesugaringEnabled = true
+              }
+              kotlinOptions { jvmTarget = "17" }
+              packaging {
+                  resources.excludes += setOf("META-INF/*.kotlin_module", "META-INF/versions/9/**", "META-INF/LICENSE*", "META-INF/NOTICE*")
+              }
+          }
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+              implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+              implementation(platform("androidx.compose:compose-bom:2024.09.02"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("com.android.tools.build:apksig:8.5.2")
+              implementation("org.bouncycastle:bcpkix-jdk18on:1.78.1")
+              coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")
+          }
+          EOF_D
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF_E'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+              <application android:allowBackup="false" android:label="@string/app_name" android:largeHeap="true" android:theme="@style/T">
+                  <activity android:name=".MainActivity" android:exported="true" android:configChanges="orientation|screenSize|keyboardHidden" android:label="@string/app_name">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".InstallReceiver" android:exported="false" />
+              </application>
+          </manifest>
+          EOF_E
+
+          cat > app/src/main/res/values/strings.xml <<'EOF_F'
+          <resources><string name="app_name">Quest AC Killer</string></resources>
+          EOF_F
+
+          cat > app/src/main/res/values/themes.xml <<'EOF_G'
+          <resources>
+              <style name="T" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">#0B0F14</item>
+              </style>
+          </resources>
+          EOF_G
+
+          cat > app/src/main/java/ai/venice/questackill/ZipIo.kt <<'EOF_H'
+          package ai.venice.questackill
+
+          import java.io.Closeable
+          import java.io.File
+          import java.io.IOException
+          import java.io.InputStream
+          import java.io.RandomAccessFile
+          import java.nio.charset.StandardCharsets
+          import java.util.zip.CRC32
+          import java.util.zip.Deflater
+          import java.util.zip.Inflater
+          import java.util.zip.InflaterInputStream
+
+          data class ZipEntryInfo(
+              val name: String, val method: Int, val crc: Long,
+              val compSize: Long, val uncompSize: Long, val flags: Int, val localHeaderOffset: Long
+          )
+
+          internal fun u16(b: ByteArray, o: Int) = (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8)
+          internal fun u32(b: ByteArray, o: Int) = u16(b, o).toLong() or (u16(b, o + 2).toLong() shl 16)
+          internal fun u64(b: ByteArray, o: Int) = u32(b, o) or (u32(b, o + 4) shl 32)
+
+          private class BoundedStream(private val raf: RandomAccessFile, private var remaining: Long) : InputStream() {
+              override fun read(): Int {
+                  if (remaining <= 0) return -1
+                  remaining--
+                  return raf.read()
+              }
+              override fun read(b: ByteArray, off: Int, len: Int): Int {
+                  if (remaining <= 0) return -1
+                  val n = raf.read(b, off, minOf(len.toLong(), remaining).toInt())
+                  if (n > 0) remaining -= n
+                  return n
+              }
+          }
+
+          class ZipReader(file: File) : Closeable {
+              private val raf = RandomAccessFile(file, "r")
+              val entries: List<ZipEntryInfo> = readCd()
+
+              private fun readCd(): List<ZipEntryInfo> {
+                  val len = raf.length()
+                  if (len < 22) throw IOException("Not a zip")
+                  val scanLen = minOf(len, 66_022L).toInt()
+                  val buf = ByteArray(scanLen)
+                  raf.seek(len - scanLen)
+                  raf.readFully(buf)
+                  var eocd = -1
+                  for (i in scanLen - 22 downTo 0) if (u32(buf, i) == 0x06054b50L) { eocd = i; break }
+                  if (eocd < 0) throw IOException("No EOCD")
+                  val eocdAbs = len - scanLen + eocd
+                  var count = u16(buf, eocd + 10).toLong()
+                  var cdOff = u32(buf, eocd + 16)
+                  if (count == 0xFFFFL || cdOff == 0xFFFFFFFFL) {
+                      val loc = ByteArray(20)
+                      raf.seek(eocdAbs - 20)
+                      raf.readFully(loc)
+                      if (u32(loc, 0) != 0x07064b50L) throw IOException("No zip64 loc")
+                      raf.seek(u64(loc, 8))
+                      val h = ByteArray(56)
+                      raf.readFully(h)
+                      count = u64(h, 32)
+                      cdOff = u64(h, 48)
+                  }
+                  val out = ArrayList<ZipEntryInfo>(count.toInt())
+                  var p = cdOff
+                  repeat(count.toInt()) {
+                      val h = ByteArray(46)
+                      raf.seek(p)
+                      raf.readFully(h)
+                      if (u32(h, 0) != 0x02014b50L) throw IOException("Bad CD")
+                      val flags = u16(h, 8)
+                      val method = u16(h, 10)
+                      val crc = u32(h, 16)
+                      var comp = u32(h, 20)
+                      var uncomp = u32(h, 24)
+                      val nameLen = u16(h, 28)
+                      val extraLen = u16(h, 30)
+                      val commentLen = u16(h, 32)
+                      var localOff = u32(h, 42)
+                      val nb = ByteArray(nameLen)
+                      raf.seek(p + 46L)
+                      raf.readFully(nb)
+                      val name = String(nb, StandardCharsets.UTF_8)
+                      if (comp == 0xFFFFFFFFL || uncomp == 0xFFFFFFFFL || localOff == 0xFFFFFFFFL) {
+                          val ex = ByteArray(extraLen)
+                          raf.seek(p + 46L + nameLen)
+                          raf.readFully(ex)
+                          var q = 0
+                          while (q + 4 <= ex.size) {
+                              val id = u16(ex, q)
+                              val sz = u16(ex, q + 2)
+                              if (id == 1) {
+                                  var r = q + 4
+                                  if (uncomp == 0xFFFFFFFFL && r + 8 <= ex.size) { uncomp = u64(ex, r); r += 8 }
+                                  if (comp == 0xFFFFFFFFL && r + 8 <= ex.size) { comp = u64(ex, r); r += 8 }
+                                  if (localOff == 0xFFFFFFFFL && r + 8 <= ex.size) { localOff = u64(ex, r); r += 8 }
+                              }
+                              q += 4 + sz
+                          }
+                      }
+                      out.add(ZipEntryInfo(name, method, crc, comp, uncomp, flags, localOff))
+                      p += 46L + nameLen + extraLen + commentLen
+                  }
+                  return out
+              }
+
+              private fun dataOff(e: ZipEntryInfo): Long {
+                  raf.seek(e.localHeaderOffset)
+                  val h = ByteArray(30)
+                  raf.readFully(h)
+                  if (u32(h, 0) != 0x04034b50L) throw IOException("Bad local header")
+                  return e.localHeaderOffset + 30L + u16(h, 26) + u16(h, 28)
+              }
+
+              fun openData(e: ZipEntryInfo): InputStream {
+                  raf.seek(dataOff(e))
+                  val raw = BoundedStream(raf, e.compSize)
+                  return if (e.method == 0) raw else InflaterInputStream(raw, Inflater(true), 1 shl 16)
+              }
+
+              fun readAll(e: ZipEntryInfo): ByteArray {
+                  val out = java.io.ByteArrayOutputStream(e.uncompSize.toInt().coerceAtLeast(1024))
+                  openData(e).use { it.copyTo(out, 1 shl 16) }
+                  return out.toByteArray()
+              }
+
+              override fun close() = raf.close()
+          }
+
+          class ZipWriter(file: File) : Closeable {
+              private class Cd(val name: ByteArray, val method: Int, val crc: Long, val comp: Long, val uncomp: Long, val flags: Int, val offset: Long)
+              private val raf = RandomAccessFile(file, "rw")
+              private val cd = ArrayList<Cd>()
+              private var pos = 0L
+              private var closed = false
+
+              init { raf.setLength(0) }
+
+              private fun w16(v: Int) { raf.write(v and 0xFF); raf.write((v ushr 8) and 0xFF) }
+              private fun w32(v: Long) {
+                  raf.write((v and 0xFF).toInt()); raf.write(((v ushr 8) and 0xFF).toInt())
+                  raf.write(((v ushr 16) and 0xFF).toInt()); raf.write(((v ushr 24) and 0xFF).toInt())
+              }
+              private fun pad(base: Long, align: Int): ByteArray {
+                  val n = ((align - ((base + 6) % align)) % align).toInt()
+                  val b = ByteArray(6 + n)
+                  b[0] = 0x35; b[1] = 0xD9.toByte(); b[2] = 0x02; b[3] = 0x00
+                  b[4] = (align and 0xFF).toByte(); b[5] = ((align ushr 8) and 0xFF).toByte()
+                  return b
+              }
+
+              inner class EntryWriter(name: String, private val method: Int, align: Int, private val knownCrc: Long = -1L) {
+                  private val nb = name.toByteArray(StandardCharsets.UTF_8)
+                  private val crc = CRC32()
+                  private val off: Long
+                  private val crcPos: Long
+                  private val sizePos: Long
+                  private var comp = 0L
+                  private var uncomp = 0L
+                  private val def: Deflater? = if (method == 8) Deflater(Deflater.DEFAULT_COMPRESSION, true) else null
+                  private val buf = ByteArray(1 shl 16)
+                  private var done = false
+
+                  init {
+                      off = pos
+                      val base = off + 30L + nb.size
+                      val extra = if (align > 1) pad(base, align) else ByteArray(0)
+                      w32(0x04034b50L); w16(20); w16(0x0800); w16(method); w16(0); w16(0x21)
+                      crcPos = raf.filePointer
+                      w32(if (knownCrc >= 0) knownCrc else 0L)
+                      sizePos = raf.filePointer
+                      w32(0L); w32(0L)
+                      w16(nb.size); w16(extra.size)
+                      raf.write(nb)
+                      if (extra.isNotEmpty()) raf.write(extra)
+                      pos = raf.filePointer
+                  }
+
+                  fun write(b: ByteArray, o: Int = 0, l: Int = b.size) {
+                      if (knownCrc < 0) crc.update(b, o, l)
+                      uncomp += l
+                      val d = def
+                      if (d == null) { raf.write(b, o, l); comp += l }
+                      else {
+                          d.setInput(b, o, l)
+                          while (!d.needsInput()) {
+                              val n = d.deflate(buf)
+                              if (n <= 0) break
+                              raf.write(buf, 0, n)
+                              comp += n
+                          }
+                      }
+                  }
+
+                  fun finish() {
+                      if (done) return
+                      done = true
+                      val d = def
+                      if (d != null) {
+                          d.finish()
+                          while (!d.finished()) {
+                              val n = d.deflate(buf)
+                              if (n <= 0) break
+                              raf.write(buf, 0, n)
+                              comp += n
+                          }
+                          d.end()
+                      }
+                      val end = raf.filePointer
+                      val cv = if (knownCrc >= 0) knownCrc else crc.value
+                      raf.seek(crcPos); w32(cv)
+                      raf.seek(sizePos); w32(comp); w32(uncomp)
+                      raf.seek(end)
+                      pos = end
+                      cd.add(Cd(nb, method, cv, comp, uncomp, 0x0800, off))
+                  }
+              }
+
+              fun entry(name: String, method: Int, align: Int = 1, knownCrc: Long = -1L) = EntryWriter(name, method, align, knownCrc)
+
+              override fun close() {
+                  if (closed) return
+                  closed = true
+                  val cdStart = raf.filePointer
+                  for (r in cd) {
+                      w32(0x02014b50L); w16(20); w16(20); w16(r.flags); w16(r.method); w16(0); w16(0x21)
+                      w32(r.crc); w32(r.comp); w32(r.uncomp)
+                      w16(r.name.size); w16(0); w16(0); w16(0); w16(0); w32(0L); w32(r.offset)
+                      raf.write(r.name)
+                  }
+                  val cdSize = raf.filePointer - cdStart
+                  val count = cd.size.toLong()
+                  w32(0x06054b50L); w16(0); w16(0)
+                  w16(count.toInt()); w16(count.toInt())
+                  w32(cdSize); w32(cdStart); w16(0)
+                  raf.close()
+              }
+          }
+          EOF_H
+
+          cat > app/src/main/java/ai/venice/questackill/Axm.kt <<'EOF_I'
+          package ai.venice.questackill
+
+          import java.nio.charset.StandardCharsets
+
+          object Axm {
+              data class Info(val packageName: String?, val minSdk: Int, val targetSdk: Int)
+
+              private class Pool(private val d: ByteArray, private val s: Int) {
+                  val count = u32(d, s + 8).toInt()
+                  private val flags = u32(d, s + 16).toInt()
+                  private val start = u32(d, s + 20).toInt()
+                  private val utf8 = (flags and 0x100) != 0
+                  fun get(i: Int): String {
+                      if (i < 0 || i >= count) return ""
+                      val off = start + u32(d, s + 28 + i * 4).toInt()
+                      return if (utf8) {
+                          var p = off
+                          p += if ((d[p].toInt() and 0x80) != 0) 2 else 1
+                          val n = d[p].toInt() and 0xFF
+                          p++
+                          String(d, p, n, StandardCharsets.UTF_8)
+                      } else {
+                          var p = off
+                          var n = u16(d, p); p += 2
+                          if ((n and 0x8000) != 0) { n = ((n and 0x7FFF) shl 16) or u16(d, p); p += 2 }
+                          String(d, p, n * 2, StandardCharsets.UTF_16LE)
+                      }
+                  }
+              }
+
+              fun parse(a: ByteArray): Info {
+                  var pkg: String? = null
+                  var minSdk = 0
+                  var targetSdk = 0
+                  if (a.size < 8 || u16(a, 0) != 0x0003) return Info(null, 0, 0)
+                  var off = u16(a, 2)
+                  var pool: Pool? = null
+                  while (off + 8 <= a.size) {
+                      val type = u16(a, off)
+                      val hsz = u16(a, off + 2)
+                      val sz = u32(a, off + 4).toInt()
+                      if (sz <= 0) break
+                      if (type == 0x0001) pool = Pool(a, off)
+                      else if (type == 0x0102 && pool != null) {
+                          val ext = off + hsz
+                          val as0 = u16(a, ext + 8)
+                          val asz = u16(a, ext + 10)
+                          val ac = u16(a, ext + 12)
+                          var p = ext + as0
+                          repeat(ac) {
+                              val ni = u32(a, p + 4).toInt()
+                              val dt = a[p + 15].toInt() and 0xFF
+                              val v = u32(a, p + 16).toInt()
+                              when (pool.get(ni)) {
+                                  "package" -> if (dt == 0x03) pkg = pool.get(v)
+                                  "minSdkVersion" -> if (dt == 0x10) minSdk = v
+                                  "targetSdkVersion" -> if (dt == 0x10) targetSdk = v
+                              }
+                              p += asz
+                          }
+                      }
+                      off += sz
+                  }
+                  return Info(pkg, minSdk, targetSdk)
+              }
+          }
+          EOF_I
+
+          cat > app/src/main/java/ai/venice/questackill/DexPatch.kt <<'EOF_J'
+          package ai.venice.questackill
+
+          import java.security.MessageDigest
+          import java.util.zip.Adler32
+
+          object DexPatch {
+              fun replaceAll(dex: ByteArray, pairs: List<Pair<ByteArray, ByteArray>>): Int {
+                  var hits = 0
+                  for (pair in pairs) {
+                      val old = pair.first
+                      val new = pair.second
+                      if (old.size != new.size || old.isEmpty()) continue
+                      var i = 0
+                      while (i <= dex.size - old.size) {
+                          val idx = find(dex, old, i)
+                          if (idx < 0) break
+                          System.arraycopy(new, 0, dex, idx, new.size)
+                          hits++
+                          i = idx + new.size
+                      }
+                  }
+                  if (hits > 0) fix(dex)
+                  return hits
+              }
+
+              private fun find(hay: ByteArray, needle: ByteArray, from: Int): Int {
+                  val f = needle[0]
+                  val last = hay.size - needle.size
+                  var i = from
+                  while (i <= last) {
+                      if (hay[i] == f) {
+                          var j = 1
+                          while (j < needle.size && hay[i + j] == needle[j]) j++
+                          if (j == needle.size) return i
+                      }
+                      i++
+                  }
+                  return -1
+              }
+
+              private fun fix(dex: ByteArray) {
+                  if (dex.size < 32) return
+                  val sha = MessageDigest.getInstance("SHA-1").digest(dex.copyOfRange(32, dex.size))
+                  System.arraycopy(sha, 0, dex, 12, 20)
+                  val ad = Adler32()
+                  ad.update(dex, 12, dex.size - 12)
+                  val v = ad.value
+                  dex[8] = (v and 0xFF).toByte()
+                  dex[9] = ((v ushr 8) and 0xFF).toByte()
+                  dex[10] = ((v ushr 16) and 0xFF).toByte()
+                  dex[11] = ((v ushr 24) and 0xFF).toByte()
+              }
+          }
+          EOF_J
+
+          cat > app/src/main/java/ai/venice/questackill/SigningKey.kt <<'EOF_K'
+          package ai.venice.questackill
+
+          import android.content.Context
+          import org.bouncycastle.asn1.x500.X500Name
+          import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
+          import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
+          import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
+          import java.io.File
+          import java.math.BigInteger
+          import java.security.KeyPairGenerator
+          import java.security.KeyStore
+          import java.security.PrivateKey
+          import java.security.cert.X509Certificate
+          import java.util.Date
+
+          object SigningKey {
+              private const val ALIAS = "ackill"
+              private const val PASS = "ackill-pass"
+              data class Material(val key: PrivateKey, val cert: X509Certificate)
+
+              @Synchronized
+              fun get(ctx: Context): Material {
+                  val f = File(ctx.filesDir, "signing.p12")
+                  if (f.exists()) runCatching { return load(f) }
+                  val fresh = generate()
+                  runCatching { save(f, fresh) }
+                  return fresh
+              }
+
+              private fun load(f: File): Material {
+                  val ks = KeyStore.getInstance("PKCS12")
+                  f.inputStream().use { ks.load(it, PASS.toCharArray()) }
+                  return Material(ks.getKey(ALIAS, PASS.toCharArray()) as PrivateKey, ks.getCertificate(ALIAS) as X509Certificate)
+              }
+
+              private fun save(f: File, m: Material) {
+                  val ks = KeyStore.getInstance("PKCS12")
+                  ks.load(null, null)
+                  ks.setKeyEntry(ALIAS, m.key, PASS.toCharArray(), arrayOf(m.cert))
+                  f.outputStream().use { ks.store(it, PASS.toCharArray()) }
+              }
+
+              private fun generate(): Material {
+                  val g = KeyPairGenerator.getInstance("RSA")
+                  g.initialize(2048)
+                  val kp = g.generateKeyPair()
+                  val sub = X500Name("CN=QuestACKill, O=Venice, C=US")
+                  val now = Date()
+                  val b = JcaX509v3CertificateBuilder(sub, BigInteger.valueOf(System.currentTimeMillis()), now, Date(now.time + 946080000000L), sub, kp.public)
+                  val s = JcaContentSignerBuilder("SHA256withRSA").build(kp.private)
+                  return Material(kp.private, JcaX509CertificateConverter().getCertificate(b.build(s)))
+              }
+          }
+          EOF_K
+
+          cat > app/src/main/java/ai/venice/questackill/Scan.kt <<'EOF_L'
+          package ai.venice.questackill
+
+          import java.io.File
+          import java.util.zip.ZipFile
+
+          enum class Severity { HIGH, MEDIUM, LOW }
+          enum class Action { KEEP, REMOVE, BYPASS }
+
+          data class Finding(
+              val id: String, val label: String, val severity: Severity,
+              val evidence: List<String>, val removableEntries: List<String>,
+              val bypassable: Boolean, var action: Action = Action.BYPASS
+          )
+
+          data class ApkInfo(
+              val packageName: String, val minSdk: Int, val targetSdk: Int,
+              val certDer: ByteArray?, val entryCount: Int, val findings: List<Finding>
+          )
+
+          object Scanner {
+              private class Rule(val id: String, val label: String, val sev: Severity, val libs: List<String>, val toks: List<String>, val assets: List<String>)
+
+              private val RULES = listOf(
+                  Rule("eos", "Epic Online Services anti-cheat", Severity.HIGH, listOf("libEOSSDK", "libeossdk"), listOf("com/epicgames/eos"), listOf("assets/eossdk", "assets/EOSSDK")),
+                  Rule("battleye", "BattlEye", Severity.HIGH, listOf("libBEService", "libBEClient", "libBattlEye"), listOf("com/battleye"), listOf("BattlEye/")),
+                  Rule("eac", "Easy Anti-Cheat", Severity.HIGH, listOf("libEasyAntiCheat", "libeasyanticheat"), listOf("com/epicgames/eac"), emptyList()),
+                  Rule("integrity", "Play Integrity / SafetyNet", Severity.MEDIUM, emptyList(), listOf("safetynet/SafetyNetClient", "integrity/IntegrityManager"), emptyList()),
+                  Rule("sigcheck", "Signature verification", Severity.MEDIUM, emptyList(), listOf("GET_SIGNATURES", "GET_SIGNING_CERTIFICATES"), emptyList())
+              )
+
+              fun scan(apk: File): ApkInfo {
+                  var manifest: Axm.Info? = null
+                  var certDer: ByteArray? = null
+                  val names = ArrayList<String>()
+                  val rem = HashMap<String, MutableList<String>>()
+                  val toks = HashMap<String, MutableList<String>>()
+
+                  ZipFile(apk).use { zf ->
+                      val all = zf.entries().toList()
+                      for (e in all) {
+                          names.add(e.name)
+                          if (e.name == "AndroidManifest.xml") manifest = Axm.parse(zf.getInputStream(e).use { it.readBytes() })
+                          if (certDer == null && e.name.startsWith("META-INF/") && (e.name.endsWith(".RSA", true) || e.name.endsWith(".DSA", true) || e.name.endsWith(".EC", true))) {
+                              certDer = runCatching {
+                                  java.security.cert.CertificateFactory.getInstance("X.509")
+                                      .generateCertificates(zf.getInputStream(e).use { it.readBytes() }.inputStream()).first().encoded
+                              }.getOrNull()
+                          }
+                          val base = e.name.substringAfterLast('/').substringBefore(".so")
+                          for (r in RULES) {
+                              if (r.libs.any { base.equals(it, true) }) rem.getOrPut(r.id) { ArrayList() }.add(e.name)
+                              else if (r.assets.any { e.name.startsWith(it, true) }) rem.getOrPut(r.id) { ArrayList() }.add(e.name)
+                          }
+                      }
+                      for (e in all) {
+                          if (!e.name.matches(Regex("classes\\d*\\.dex"))) continue
+                          if (e.size > 314572800L) continue
+                          val text = String(zf.getInputStream(e).use { it.readBytes() }, Charsets.ISO_8859_1)
+                          for (r in RULES) for (t in r.toks) if (text.contains(t)) toks.getOrPut(r.id) { ArrayList() }.add("dex: " + t)
+                      }
+                  }
+
+                  val findings = RULES.mapNotNull { r ->
+                      val a = rem[r.id].orEmpty()
+                      val b = toks[r.id].orEmpty()
+                      if (a.isEmpty() && b.isEmpty()) return@mapNotNull null
+                      Finding(r.id, r.label, r.sev, (a + b).distinct().take(12), a.distinct(), true)
+                  }
+
+                  return ApkInfo(manifest?.packageName ?: "unknown", manifest?.minSdk ?: 0, manifest?.targetSdk ?: 0, certDer, names.size, findings)
+              }
+          }
+          EOF_L
+
+          cat > app/src/main/java/ai/venice/questackill/Rebuilder.kt <<'EOF_M'
+          package ai.venice.questackill
+
+          import android.content.Context
+          import com.android.apksig.ApkSigner
+          import java.io.File
+          import java.io.IOException
+          import java.security.MessageDigest
+
+          class Rebuilder(
+              private val ctx: Context, private val src: File, private val info: ApkInfo,
+              private val workDir: File, private val log: (String) -> Unit, private val progress: (Float, String) -> Unit
+          ) {
+              fun build(): File {
+                  val drop = HashSet<String>()
+                  var bypassSig = false
+                  for (f in info.findings) {
+                      when (f.action) {
+                          Action.KEEP -> {}
+                          Action.BYPASS -> { drop.addAll(f.removableEntries.filter { it.endsWith(".so") }); bypassSig = true }
+                          Action.REMOVE -> { drop.addAll(f.removableEntries); bypassSig = true }
+                      }
+                  }
+
+                  val unsigned = File(workDir, "unsigned.apk")
+                  val signed = File(workDir, "signed.apk")
+                  val material = SigningKey.get(ctx)
+                  val pairs = buildPairs(material)
+
+                  ZipReader(src).use { reader ->
+                      ZipWriter(unsigned).use { writer ->
+                          val total = reader.entries.size.toFloat()
+                          var done = 0
+                          for (e in reader.entries) {
+                              done++
+                              if (done % 40 == 0) progress(done / total * 0.75f, "Repacking " + done)
+                              if (e.name.startsWith("META-INF/") && (e.name.endsWith(".SF", true) || e.name.endsWith(".RSA", true) || e.name.endsWith(".DSA", true) || e.name.endsWith(".EC", true))) continue
+                              if (e.name in drop) continue
+                              val force = e.name == "resources.arsc" || e.name.endsWith(".so")
+                              if (e.name.matches(Regex("classes\\d*\\.dex")) && pairs.isNotEmpty() && bypassSig) {
+                                  val bytes = reader.readAll(e)
+                                  val hits = DexPatch.replaceAll(bytes, pairs)
+                                  if (hits > 0) log("  patched " + e.name + ": " + hits)
+                                  val w = writer.entry(e.name, 8, 1)
+                                  w.write(bytes); w.finish()
+                                  continue
+                              }
+                              val w = if (force) writer.entry(e.name, 0, 4096, e.crc) else writer.entry(e.name, e.method, 1, if (e.method == 0) e.crc else -1L)
+                              reader.openData(e).use { s ->
+                                  val buf = ByteArray(1 shl 16)
+                                  while (true) {
+                                      val n = s.read(buf)
+                                      if (n <= 0) break
+                                      w.write(buf, 0, n)
+                                  }
+                              }
+                              w.finish()
+                          }
+                      }
+                  }
+
+                  progress(0.8f, "Signing")
+                  ApkSigner.Builder(listOf(ApkSigner.SignerConfig("ackill", material.key, listOf(material.cert))))
+                      .setInputApk(unsigned)
+                      .setOutputApk(signed)
+                      .setMinSdkVersion(if (info.minSdk > 0) info.minSdk else 24)
+                      .setV1SigningEnabled(true)
+                      .setV2SigningEnabled(true)
+                      .setV3SigningEnabled(false)
+                      .build()
+                      .sign()
+
+                  unsigned.delete()
+                  if (!signed.exists() || signed.length() == 0L) throw IOException("No signing output")
+                  progress(0.95f, "Signed")
+                  return signed
+              }
+
+              private fun buildPairs(m: SigningKey.Material): List<Pair<ByteArray, ByteArray>> {
+                  val oldDer = info.certDer ?: return emptyList()
+                  val a = hashForms(oldDer)
+                  val b = hashForms(m.cert.encoded)
+                  return a.zip(b).filter { it.first.isNotEmpty() && it.first.length == it.second.length && it.first != it.second }
+                      .map { it.first.toByteArray() to it.second.toByteArray() }
+              }
+
+              private fun hashForms(der: ByteArray): List<String> {
+                  val out = ArrayList<String>()
+                  for (alg in listOf("SHA-1", "SHA-256")) {
+                      val h = MessageDigest.getInstance(alg).digest(der)
+                      val hex = h.joinToString("") { "%02x".format(it) }
+                      out.add(hex); out.add(hex.uppercase())
+                      out.add(android.util.Base64.encodeToString(h, android.util.Base64.NO_WRAP))
+                  }
+                  return out
+              }
+          }
+          EOF_M
+
+          cat > app/src/main/java/ai/venice/questackill/Output.kt <<'EOF_N'
+          package ai.venice.questackill
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import java.io.File
+
+          object Output {
+              fun write(ctx: Context, src: File, name: String): Uri {
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      val v = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, name)
+                          put(MediaStore.Downloads.MIME_TYPE, "application/vnd.android.package-archive")
+                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/QuestAC")
+                          put(MediaStore.Downloads.IS_PENDING, 1)
+                      }
+                      val r = ctx.contentResolver
+                      val uri = r.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: error("No MediaStore entry")
+                      r.openOutputStream(uri)!!.use { o -> src.inputStream().use { it.copyTo(o, 1 shl 16) } }
+                      r.update(uri, ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }, null, null)
+                      return uri
+                  }
+                  @Suppress("DEPRECATION")
+                  val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "QuestAC")
+                  dir.mkdirs()
+                  val t = File(dir, name)
+                  src.inputStream().use { i -> t.outputStream().use { i.copyTo(it, 1 shl 16) } }
+                  return Uri.fromFile(t)
+              }
+          }
+          EOF_N
+
+          cat > app/src/main/java/ai/venice/questackill/Installer.kt <<'EOF_O'
+          package ai.venice.questackill
+
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageInstaller
+          import android.net.Uri
+          import android.os.Build
+          import android.widget.Toast
+
+          class InstallReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) {
+                  val s = i.getIntExtra(PackageInstaller.EXTRA_STATUS, -1)
+                  Toast.makeText(c, if (s == PackageInstaller.STATUS_SUCCESS) "Installed" else "Install failed", Toast.LENGTH_LONG).show()
+              }
+          }
+
+          object Installer {
+              fun install(ctx: Context, uri: Uri) {
+                  runCatching {
+                      val pi = ctx.packageManager.packageInstaller
+                      val id = pi.createSession(PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL))
+                      pi.openSession(id).use { s ->
+                          ctx.contentResolver.openInputStream(uri)!!.use { ins ->
+                              s.openWrite("base.apk", 0, -1).use { o -> ins.copyTo(o, 1 shl 16); s.fsync(o) }
+                          }
+                          val f = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
+                          s.commit(PendingIntent.getBroadcast(ctx, id, Intent(ctx, InstallReceiver::class.java), f or PendingIntent.FLAG_UPDATE_CURRENT).intentSender)
+                      }
+                  }.onFailure { Toast.makeText(ctx, "Install failed: " + it.message, Toast.LENGTH_LONG).show() }
+              }
+          }
+          EOF_O
+
+          cat > app/src/main/java/ai/venice/questackill/MainActivity.kt <<'EOF_P'
+          package ai.venice.questackill
+
+          import android.Manifest
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.provider.Settings
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.CardDefaults
+          import androidx.compose.material3.FilterChip
+          import androidx.compose.material3.LinearProgressIndicator
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateListOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.lifecycle.ViewModel
+          import androidx.lifecycle.viewModelScope
+          import androidx.lifecycle.viewmodel.compose.viewModel
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          enum class Phase { IDLE, SCANNING, READY, WORKING, DONE, ERROR }
+
+          class AppVm(private val ctx: android.content.Context) : ViewModel() {
+              var phase by mutableStateOf(Phase.IDLE)
+              var sourceName by mutableStateOf<String?>(null)
+              var info by mutableStateOf<ApkInfo?>(null)
+              val logLines = mutableStateListOf<String>()
+              var progress by mutableStateOf(0f)
+              var stage by mutableStateOf("")
+              var outputUri by mutableStateOf<Uri?>(null)
+              var outputName by mutableStateOf<String?>(null)
+              var error by mutableStateOf<String?>(null)
+              private var src: File? = null
+
+              fun log(s: String) {
+                  if (logLines.size > 800) logLines.removeAt(0)
+                  logLines.add(s)
+              }
+
+              fun scan(uri: Uri, name: String) {
+                  phase = Phase.SCANNING
+                  error = null
+                  outputUri = null
+                  outputName = null
+                  logLines.clear()
+                  viewModelScope.launch(Dispatchers.IO) {
+                      try {
+                          val dir = File(ctx.cacheDir, "work").apply { mkdirs() }
+                          dir.listFiles()?.forEach { it.delete() }
+                          val copy = File(dir, "input.apk")
+                          ctx.contentResolver.openInputStream(uri)!!.use { i -> copy.outputStream().use { i.copyTo(it, 1 shl 16) } }
+                          src = copy
+                          sourceName = name
+                          log("Loaded " + (copy.length() / 1048576) + " MB")
+                          val sc = Scanner.scan(copy)
+                          log("Package: " + sc.packageName)
+                          if (sc.findings.isEmpty()) log("No known anti-cheat detected.")
+                          info = sc
+                          phase = Phase.READY
+                      } catch (t: Throwable) {
+                          error = t.message ?: t.toString()
+                          phase = Phase.ERROR
+                      }
+                  }
+              }
+
+              fun setAction(f: Finding, a: Action) {
+                  val c = info ?: return
+                  info = c.copy(findings = c.findings.map { if (it.id == f.id) it.copy(action = a) else it })
+              }
+
+              fun run() {
+                  val s = src ?: return
+                  val i = info ?: return
+                  phase = Phase.WORKING
+                  progress = 0f
+                  logLines.clear()
+                  viewModelScope.launch(Dispatchers.IO) {
+                      try {
+                          val dir = File(ctx.cacheDir, "work").apply { mkdirs() }
+                          val out = Rebuilder(ctx, s, i, dir, ::log) { p, st -> progress = p; stage = st }.build()
+                          val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+                          val name = i.packageName.replace(Regex("[^A-Za-z0-9._-]"), "_") + "-acmod-" + stamp + ".apk"
+                          outputUri = Output.write(ctx, out, name)
+                          outputName = "Download/QuestAC/" + name
+                          log("Saved " + name)
+                          progress = 1f
+                          stage = "Done"
+                          phase = Phase.DONE
+                      } catch (t: Throwable) {
+                          error = t.message ?: t.toString()
+                          log("FAILED: " + t.message)
+                          phase = Phase.ERROR
+                      }
+                  }
+              }
+          }
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF6EE7B7), background = Color(0xFF0B0F14), surface = Color(0xFF131A22))) {
+                          Surface(Modifier.fillMaxSize(), color = Color(0xFF0B0F14)) { Screen() }
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun Screen() {
+              val ctx = LocalContext.current
+              val vm: AppVm = viewModel { AppVm(ctx.applicationContext) }
+              val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u -> if (u != null) vm.scan(u, "input.apk") }
+              val perms = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+
+              Column(Modifier.fillMaxSize().padding(16.dp)) {
+                  Text("QUEST AC KILLER", fontWeight = FontWeight.Black, fontSize = 20.sp, color = Color(0xFF6EE7B7))
+                  Text("Strip and re-sign anti-cheat from Quest APKs", fontSize = 11.sp, color = Color(0xFF7C8A99))
+                  Spacer(Modifier.height(12.dp))
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(onClick = {
+                          if (Build.VERSION.SDK_INT <= 28) perms.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                          picker.launch(arrayOf("*/*"))
+                      }, enabled = vm.phase != Phase.WORKING && vm.phase != Phase.SCANNING) { Text("Select APK") }
+                      OutlinedButton(onClick = {
+                          if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) ctx.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                      }) { Text("All-files access") }
+                  }
+                  vm.sourceName?.let { Spacer(Modifier.height(8.dp)); Text(it, fontSize = 12.sp, color = Color(0xFFB6C2CF)) }
+                  vm.info?.let { Text(it.packageName + " - minSdk " + it.minSdk, fontSize = 11.sp, color = Color(0xFF7C8A99)) }
+                  Spacer(Modifier.height(8.dp))
+                  if (vm.phase == Phase.WORKING) {
+                      LinearProgressIndicator(progress = { vm.progress }, modifier = Modifier.fillMaxWidth())
+                      Text(vm.stage, fontSize = 11.sp, color = Color(0xFF6EE7B7))
+                  }
+                  vm.info?.findings?.let { list ->
+                      if (list.isNotEmpty()) {
+                          Text("DETECTED", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF7C8A99))
+                          LazyColumn(Modifier.weight(0.55f).fillMaxWidth()) { items(list) { f -> FindingRow(f) { vm.setAction(f, it) } } }
+                      }
+                  }
+                  if (vm.logLines.isNotEmpty()) {
+                      LazyColumn(Modifier.weight(0.45f).fillMaxWidth()) {
+                          items(vm.logLines) { Text(it, fontFamily = FontFamily.Monospace, fontSize = 10.sp, color = Color(0xFF8FA0B0)) }
+                      }
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(onClick = { vm.run() }, enabled = vm.phase == Phase.READY && (vm.info?.findings?.isNotEmpty() == true), modifier = Modifier.weight(1f)) { Text("Build patched APK") }
+                      vm.outputUri?.let { u -> Button(onClick = { Installer.install(ctx, u) }) { Text("Install") } }
+                  }
+                  vm.outputName?.let { Text("Saved: " + it, fontSize = 11.sp, color = Color(0xFF6EE7B7)) }
+                  vm.error?.let { Text(it, fontSize = 11.sp, color = Color(0xFFFF8A80)) }
+              }
+          }
+
+          @Composable
+          private fun FindingRow(f: Finding, onPick: (Action) -> Unit) {
+              val c = when (f.severity) {
+                  Severity.HIGH -> Color(0xFFFF8A80)
+                  Severity.MEDIUM -> Color(0xFFFFD180)
+                  Severity.LOW -> Color(0xFFB6C2CF)
+              }
+              Card(Modifier.fillMaxWidth().padding(vertical = 3.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF131A22))) {
+                  Column(Modifier.padding(10.dp)) {
+                      Text(f.label, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = c)
+                      f.evidence.take(3).forEach { Text("- " + it, fontSize = 10.sp, color = Color(0xFF7C8A99), maxLines = 1) }
+                      Spacer(Modifier.height(6.dp))
+                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Action.entries.forEach { a ->
+                              FilterChip(selected = f.action == a, onClick = { onPick(a) }, label = { Text(a.name.lowercase(), fontSize = 10.sp) })
+                          }
+                      }
+                  }
+              }
+          }
+          EOF_P
+
+          echo done
+      - name: Build
+        run: |
+          cd project
+          gradle assembleDebug
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: QuestACKill build ${{ github.run_number }}
+          body: Tap QuestACKill.apk below to install on the headset.
+          files: project/app/build/outputs/apk/debug/app-debug.apk
 
